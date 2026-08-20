@@ -35,6 +35,6 @@ dist-ssr
 *.sln
 *.sw?
 
-# Git history backups created during repo move scrub — NEVER push these, they carry the old leaked .env blobs
+# Git history backups created during repo move scrub â€” NEVER push these, they carry the old leaked .env blobs
 .git.BACKUP-*
 .git.BACKUP-*/**
