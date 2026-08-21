@@ -12,24 +12,12 @@ CREATE TABLE IF NOT EXISTS public.admin_users (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Seed the one admin user the UI currently supports ("portia").
--- Password: beRICH$$  → hashed with sha256, stored as base64(sha256(password||salt)).
--- The frontend login never trusts itself; it runs the exact check against
--- Supabase's crypto extensions (we fall back to a deterministic bcrypt-equivalent
--- hash embedded via pgcrypto gen_salt if available, otherwise use hash below).
--- For simplicity we pre-compute a SHA-256 of the salted pw; the login RPC below
--- verifies it. This avoids pgcrypto dependency if not enabled.
---
--- salt = "bbb-admin-salt-v1"
--- digest = sha256( "portia||beRICH$$||bbb-admin-salt-v1" )
--- We store both username + hex digest for login RPC.
-INSERT INTO public.admin_users (username, password_hash, display_name)
-VALUES (
-  'portia',
-  encode(digest('portia||beRICH$$||bbb-admin-salt-v1', 'sha256'), 'hex'),
-  'Portia'
-)
-ON CONFLICT (username) DO NOTHING;
+-- NOTE: BuiltByBakes admin login now uses Netlify env vars
+-- (BBB_ADMIN_USERNAME / BBB_ADMIN_PASSWORD) and does not require any seeded
+-- rows in this table. If you later want to use the DB path, insert rows
+-- yourself via Supabase SQL Editor — never commit real passwords into source
+-- control. Do not add any INSERT statements here with real credentials, or
+-- Netlify/GitHub secret scanners will fail the build.
 
 -- ---------------------------------------------------------
 -- 2. WEEKLY BROWNIE LIMITS  (single active row controls the current week cap;
