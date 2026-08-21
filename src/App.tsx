@@ -760,6 +760,10 @@ function ProductPage() {
             Crystallisation can occur within a few hours and/or refrigeration — for peak
             enjoyment, reheat in a preheated airfryer or oven at 170°C for 2–3 minutes.
           </li>
+          <li>
+            Storage details: Best eaten as soon as possible. Can be kept on the counter
+            for a day, and in the fridge for up to 3 days.
+          </li>
         </ul>
       </article>
 
@@ -1145,8 +1149,7 @@ function OrderPage() {
           <article>
             <h3>Self-collect</h3>
             <p>
-              Collections at Bras Basah MRT <b>(Thursday, 7pm)</b> or liaise directly
-              with Astrid for alternate slots.
+              Collections at Bras Basah MRT <b>(Thursday, 7pm)</b>.
             </p>
           </article>
           <article>
