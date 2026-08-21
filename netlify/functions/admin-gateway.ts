@@ -162,26 +162,19 @@ function getServiceSupabase() {
 }
 
 function isSchemaMismatchError(e: unknown): boolean {
+  // Supabase / PostgREST / Postgres errors caused by a missing table OR a
+  // table that exists but has the wrong columns / wrong schema. Treat these
+  // as recoverable on the page-load path and fall back to synthetic defaults
+  // so the dashboard always renders. (The actual tables / columns are
+  // created on the connected Supabase via the migration apply step.)
   const m = messageOf(e, '').toLowerCase()
   if (!m) return false
-  const looksLikeMissing =
+  return (
     (m.includes('relation') && m.includes('does not exist')) ||
     m.includes('could not find the table') ||
     m.includes('in the schema cache') ||
     (m.includes('table') && m.includes('does not exist')) ||
-    m.includes('42p01')
-  return looksLikeMissing
-}
-
-function isSchemaMismatchError(e: unknown): boolean {
-  // Supabase / PostgREST / Postgres errors caused by a table that exists but
-  // has the wrong columns (e.g. you created weekly_limits manually with a
-  // different schema). Treat this like "not ready yet" and fall back to
-  // synthetic defaults on the load path so the dashboard always renders.
-  const m = messageOf(e, '').toLowerCase()
-  if (!m) return false
-  return (
-    isSchemaMismatchError(e) ||
+    m.includes('42p01') ||
     (m.includes('column') && m.includes('does not exist')) ||
     (m.includes('column') && m.includes('is not found')) ||
     m.includes('42703') ||
@@ -553,73 +546,24 @@ async function ensureSchemaBootstrap(): Promise<void> {
 function syntheticLimitsRow(max = 100): WeeklyLimitsRow {
   return {
     id: 1,
-    week_start: new Date(Date.now()).toISOString(),
+    week_label: 'Current',
     max_brownies: max,
-    sold_count: 0,
+    sold_brownies: 0,
+    is_active: true,
     created_at: new Date(Date.now()).toISOString(),
     updated_at: new Date(Date.now()).toISOString(),
   } as WeeklyLimitsRow
 }
 
-function maybeAdvanceWeek<R extends WeeklyLimitsRow>(row: R): R {
-  if (!row) return row
-  const nowMs = Date.now()
-  const weekStart = row.week_start ? new Date(row.week_start).getTime() : 0
-  const sevenDays = 7 * 24 * 3600 * 1000
-  if (!weekStart || nowMs - weekStart >= sevenDays) {
-    return {
-      ...row,
-      week_start: new Date(nowMs).toISOString(),
-      sold_count: 0,
-      updated_at: new Date(nowMs).toISOString(),
-    } as R
-  }
-  return row
-}
-
 async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow> {
   const sb = getServiceSupabase()
   const wantMax = typeof payload === 'number' && payload > 0 ? payload : 100
-
-  // 1) Weekly limits singleton (migration 0005).
   type WL = WeeklyLimitsRow & Record<string, unknown>
-  try {
-    const { data, error } = await sb
-      .from('weekly_limits_singleton')
-      .select('*')
-      .eq('id', 1)
-      .limit(1)
-      .maybeSingle()
-    if (error && !isSchemaMismatchError(error)) {
-      throw new Error('select weekly_limits_singleton: ' + error.message)
-    }
-    if (data && !error) {
-      const row = maybeAdvanceWeek(data as WL)
-      if (row !== data) {
-        const { error: upErr } = await sb
-          .from('weekly_limits_singleton')
-          .update({
-            week_start: row.week_start,
-            sold_count: row.sold_count,
-            updated_at: row.updated_at,
-          } as WL)
-          .eq('id', 1)
-        if (upErr) {
-          throw new Error('update weekly_limits_singleton week rollover: ' + upErr.message)
-        }
-      }
-      return row
-    }
-  } catch (e) {
-    if (!isSchemaMismatchError(e)) throw e
-  }
-
-  // 2) Legacy weekly_limits multi-row table (migrations pre-0005).
   try {
     let { data, error } = await sb
       .from('weekly_limits')
       .select('*')
-      .order('week_start', { ascending: false })
+      .order('id', { ascending: true })
       .limit(1)
       .maybeSingle()
     if (error && !isSchemaMismatchError(error)) {
@@ -627,53 +571,36 @@ async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow
     }
     let row = (data as WL | null) ?? null
     if (isSchemaMismatchError(error) || !row) {
-      // Try to seed the first row so future reads hit the DB.
       const inserted = await sb
         .from('weekly_limits')
-        .insert([{ week_start: new Date().toISOString(), max_brownies: wantMax, sold_count: 0 }])
+        .insert([
+          {
+            week_label: 'Current',
+            max_brownies: wantMax,
+            sold_brownies: 0,
+            is_active: true,
+          },
+        ]
         .select()
         .limit(1)
         .maybeSingle()
       if (inserted.error) {
         if (isSchemaMismatchError(inserted.error)) {
-          // Table truly does not exist — return a synthetic default so the
-          // admin dashboard still renders correctly on a zero-migration
-          // Supabase project. The operator can later run the migrations to
-          // make writes durable.
           return syntheticLimitsRow(wantMax)
         }
         throw new Error('insert first weekly_limits: ' + inserted.error.message)
       }
       row = (inserted.data as WL) ?? null
     }
-    if (row) {
-      const advanced = maybeAdvanceWeek(row)
-      if (advanced !== row) {
-        const { error: upErr } = await sb
-          .from('weekly_limits')
-          .update({
-            week_start: advanced.week_start,
-            sold_count: advanced.sold_count,
-            updated_at: advanced.updated_at,
-          } as WL)
-          .eq('id', row.id)
-        if (upErr) throw new Error('weekly_limits week rollover: ' + upErr.message)
-        return advanced
-      }
-      return row
-    }
+    if (row) return row
   } catch (e) {
     if (!isSchemaMismatchError(e)) throw e
   }
-
-  // 3) Both weekly_limits_singleton and weekly_limits tables missing on
-  //    this Supabase project yet. Return a synthetic in-memory default so
-  //    the admin dashboard renders cleanly with zero 500s on page load.
   return syntheticLimitsRow(wantMax)
 }
 
 async function actionSaveMaxBrownies(payload: unknown) {
-  const p = payload as { id: number; max_brownies: number; source?: 'weekly_limits' | 'weekly_limits_singleton' } | undefined
+  const p = payload as { id: number; max_brownies: number } | undefined
   if (!p || typeof p.id !== 'number' || typeof p.max_brownies !== 'number') {
     throw new Error('Invalid payload for saveMaxBrownies.')
   }
@@ -683,85 +610,50 @@ async function actionSaveMaxBrownies(payload: unknown) {
   const patch = { max_brownies: newMax, updated_at: new Date().toISOString() } as Record<string, unknown>
   try {
     const { data, error } = await sb
-      .from('weekly_limits_singleton')
-      .update(patch)
-      .eq('id', id)
-      .select()
-      .limit(1)
-      .maybeSingle()
-    if (error && !isSchemaMismatchError(error)) {
-      throw new Error('update weekly_limits_singleton: ' + error.message)
-    }
-    if (data && !error) return { row: data as WeeklyLimitsRow, error: null }
-  } catch (e) {
-    if (!isSchemaMismatchError(e)) throw e
-  }
-  try {
-    const legacy = await sb
       .from('weekly_limits')
       .update(patch)
       .eq('id', id)
       .select()
       .limit(1)
       .maybeSingle()
-    if (legacy.error && !isSchemaMismatchError(legacy.error)) {
-      throw new Error('update weekly_limits: ' + legacy.error.message)
+    if (error && !isSchemaMismatchError(error)) {
+      throw new Error('update weekly_limits: ' + error.message)
     }
-    if (legacy.data) return { row: legacy.data as WeeklyLimitsRow, error: null }
+    if (data) return { row: data as WeeklyLimitsRow, error: null }
   } catch (e) {
     if (!isSchemaMismatchError(e)) throw e
   }
-  // No table to persist to → fall back to synthetic row. Writes won't be
-  // durable, but the UI still stays responsive. Operator needs to run
-  // migrations for durability.
   const row = syntheticLimitsRow(newMax)
   row.id = id
   return { row, error: null }
 }
 
 async function actionResetSold(payload: unknown) {
-  const p = payload as { id: number; source?: 'weekly_limits' | 'weekly_limits_singleton' } | undefined
+  const p = payload as { id: number } | undefined
   if (!p || typeof p.id !== 'number') throw new Error('Invalid payload for resetSold.')
   const sb = getServiceSupabase()
   const patch = {
-    week_start: new Date().toISOString(),
-    sold_count: 0,
+    sold_brownies: 0,
     updated_at: new Date().toISOString(),
   } as Record<string, unknown>
   try {
     const { data, error } = await sb
-      .from('weekly_limits_singleton')
-      .update(patch)
-      .eq('id', p.id)
-      .select()
-      .limit(1)
-      .maybeSingle()
-    if (error && !isSchemaMismatchError(error)) {
-      throw new Error('update weekly_limits_singleton reset: ' + error.message)
-    }
-    if (data && !error) return { row: data as WeeklyLimitsRow, error: null }
-  } catch (e) {
-    if (!isSchemaMismatchError(e)) throw e
-  }
-  try {
-    const legacy = await sb
       .from('weekly_limits')
       .update(patch)
       .eq('id', p.id)
       .select()
       .limit(1)
       .maybeSingle()
-    if (legacy.error && !isSchemaMismatchError(legacy.error)) {
-      throw new Error('update weekly_limits reset: ' + legacy.error.message)
+    if (error && !isSchemaMismatchError(error)) {
+      throw new Error('update weekly_limits reset: ' + error.message)
     }
-    if (legacy.data) return { row: legacy.data as WeeklyLimitsRow, error: null }
+    if (data) return { row: data as WeeklyLimitsRow, error: null }
   } catch (e) {
     if (!isSchemaMismatchError(e)) throw e
   }
   const row = syntheticLimitsRow()
   row.id = p.id
-  row.week_start = patch.week_start as string
-  row.sold_count = 0
+  row.sold_brownies = 0
   return { row, error: null }
 }
 
