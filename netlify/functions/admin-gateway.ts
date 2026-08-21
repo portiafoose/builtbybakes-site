@@ -580,7 +580,7 @@ async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow
             sold_brownies: 0,
             is_active: true,
           },
-        ]
+        ])
         .select()
         .limit(1)
         .maybeSingle()
