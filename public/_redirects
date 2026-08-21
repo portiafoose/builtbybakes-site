@@ -1,0 +1,6 @@
+# Netlify redirects — belt-and-suspenders backup for the rules in
+# netlify.toml. Order matters: first match wins, so list API proxy BEFORE SPA
+# catch-all, otherwise the catch-all would hijack every /api/* call.
+
+/api/*   /.netlify/functions/:splat   200!
+/*       /index.html                  200
