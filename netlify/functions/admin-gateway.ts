@@ -161,16 +161,35 @@ function getServiceSupabase() {
   return _sb
 }
 
-function isTableMissingError(e: unknown): boolean {
+function isSchemaMismatchError(e: unknown): boolean {
   const m = messageOf(e, '').toLowerCase()
   if (!m) return false
   const looksLikeMissing =
     (m.includes('relation') && m.includes('does not exist')) ||
     m.includes('could not find the table') ||
     m.includes('in the schema cache') ||
-    m.includes('table') && m.includes('does not exist') ||
+    (m.includes('table') && m.includes('does not exist')) ||
     m.includes('42p01')
   return looksLikeMissing
+}
+
+function isSchemaMismatchError(e: unknown): boolean {
+  // Supabase / PostgREST / Postgres errors caused by a table that exists but
+  // has the wrong columns (e.g. you created weekly_limits manually with a
+  // different schema). Treat this like "not ready yet" and fall back to
+  // synthetic defaults on the load path so the dashboard always renders.
+  const m = messageOf(e, '').toLowerCase()
+  if (!m) return false
+  return (
+    isSchemaMismatchError(e) ||
+    (m.includes('column') && m.includes('does not exist')) ||
+    (m.includes('column') && m.includes('is not found')) ||
+    m.includes('42703') ||
+    m.includes('column reference') ||
+    m.includes('no such column') ||
+    m.includes('unknown column') ||
+    (m.includes('row') && m.includes('could not be found'))
+  )
 }
 
 async function withDbError<T>(action: string, fn: () => Promise<T>): Promise<T> {
@@ -571,7 +590,7 @@ async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow
       .eq('id', 1)
       .limit(1)
       .maybeSingle()
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('select weekly_limits_singleton: ' + error.message)
     }
     if (data && !error) {
@@ -592,7 +611,7 @@ async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow
       return row
     }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
   }
 
   // 2) Legacy weekly_limits multi-row table (migrations pre-0005).
@@ -603,11 +622,11 @@ async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow
       .order('week_start', { ascending: false })
       .limit(1)
       .maybeSingle()
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('select weekly_limits: ' + error.message)
     }
     let row = (data as WL | null) ?? null
-    if (isTableMissingError(error) || !row) {
+    if (isSchemaMismatchError(error) || !row) {
       // Try to seed the first row so future reads hit the DB.
       const inserted = await sb
         .from('weekly_limits')
@@ -616,7 +635,7 @@ async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow
         .limit(1)
         .maybeSingle()
       if (inserted.error) {
-        if (isTableMissingError(inserted.error)) {
+        if (isSchemaMismatchError(inserted.error)) {
           // Table truly does not exist — return a synthetic default so the
           // admin dashboard still renders correctly on a zero-migration
           // Supabase project. The operator can later run the migrations to
@@ -644,7 +663,7 @@ async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow
       return row
     }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
   }
 
   // 3) Both weekly_limits_singleton and weekly_limits tables missing on
@@ -670,12 +689,12 @@ async function actionSaveMaxBrownies(payload: unknown) {
       .select()
       .limit(1)
       .maybeSingle()
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('update weekly_limits_singleton: ' + error.message)
     }
     if (data && !error) return { row: data as WeeklyLimitsRow, error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
   }
   try {
     const legacy = await sb
@@ -685,12 +704,12 @@ async function actionSaveMaxBrownies(payload: unknown) {
       .select()
       .limit(1)
       .maybeSingle()
-    if (legacy.error && !isTableMissingError(legacy.error)) {
+    if (legacy.error && !isSchemaMismatchError(legacy.error)) {
       throw new Error('update weekly_limits: ' + legacy.error.message)
     }
     if (legacy.data) return { row: legacy.data as WeeklyLimitsRow, error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
   }
   // No table to persist to → fall back to synthetic row. Writes won't be
   // durable, but the UI still stays responsive. Operator needs to run
@@ -717,12 +736,12 @@ async function actionResetSold(payload: unknown) {
       .select()
       .limit(1)
       .maybeSingle()
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('update weekly_limits_singleton reset: ' + error.message)
     }
     if (data && !error) return { row: data as WeeklyLimitsRow, error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
   }
   try {
     const legacy = await sb
@@ -732,12 +751,12 @@ async function actionResetSold(payload: unknown) {
       .select()
       .limit(1)
       .maybeSingle()
-    if (legacy.error && !isTableMissingError(legacy.error)) {
+    if (legacy.error && !isSchemaMismatchError(legacy.error)) {
       throw new Error('update weekly_limits reset: ' + legacy.error.message)
     }
     if (legacy.data) return { row: legacy.data as WeeklyLimitsRow, error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
   }
   const row = syntheticLimitsRow()
   row.id = p.id
@@ -755,12 +774,12 @@ async function actionDeleteOrdersBefore(payload: unknown) {
       .from('orders')
       .delete({ count: 'exact' })
       .lt('created_at', p.beforeIso)
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('delete orders before: ' + error.message)
     }
     return { deleted: Number(count ?? 0), error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
     return { deleted: 0, error: null }
   }
 }
@@ -772,12 +791,12 @@ async function actionLoadPromos() {
       .from('promo_codes')
       .select('*')
       .order('updated_at', { ascending: false })
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('select promo_codes: ' + error.message)
     }
     return { data: ((data as PromoCodeRow[]) ?? []) as PromoCodeRow[] }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
     return { data: [] as PromoCodeRow[] }
   }
 }
@@ -803,7 +822,7 @@ async function actionAddPromo(payload: unknown) {
       .select()
       .limit(1)
       .maybeSingle()
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('insert promo_codes: ' + error.message)
     }
     if (data) return { data: data as PromoCodeRow, error: null }
@@ -818,7 +837,7 @@ async function actionAddPromo(payload: unknown) {
     } as PromoCodeRow
     return { data: synthetic, error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
     const synthetic: PromoCodeRow = {
       id: Date.now(),
       ...insert,
@@ -848,13 +867,13 @@ async function actionUpdatePromo(payload: unknown) {
       .select()
       .limit(1)
       .maybeSingle()
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('update promo_codes: ' + error.message)
     }
     if (data) return { data: data as PromoCodeRow, error: null }
     return { data: null, error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
     return { data: null, error: null }
   }
 }
@@ -865,12 +884,12 @@ async function actionDeletePromo(payload: unknown) {
   const sb = getServiceSupabase()
   try {
     const { error } = await sb.from('promo_codes').delete().eq('id', p.id)
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('delete promo_codes: ' + error.message)
     }
     return { ok: true, error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
     return { ok: true, error: null }
   }
 }
@@ -885,12 +904,12 @@ async function actionLoadOrders(payload: unknown) {
       .select('*')
       .order('created_at', { ascending: false })
       .limit(limit)
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('select orders: ' + error.message)
     }
     return { data: ((data as OrderRow[]) ?? []) as OrderRow[] }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
     return { data: [] as OrderRow[] }
   }
 }
@@ -910,12 +929,12 @@ async function actionUpdateOrderStatus(payload: unknown) {
       .from('orders')
       .update({ status: p.status } as Record<string, unknown>)
       .eq('id', p.id)
-    if (error && !isTableMissingError(error)) {
+    if (error && !isSchemaMismatchError(error)) {
       throw new Error('update orders status: ' + error.message)
     }
     return { ok: true, error: null }
   } catch (e) {
-    if (!isTableMissingError(e)) throw e
+    if (!isSchemaMismatchError(e)) throw e
     return { ok: true, error: null }
   }
 }
