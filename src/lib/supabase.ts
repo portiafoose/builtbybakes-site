@@ -281,22 +281,54 @@ function adminSignature(payload: string): string {
 export async function verifyAdminLogin(
   username: string,
   password: string,
+  hours = 8,
 ): Promise<boolean> {
   const u = username.trim()
-  const sb = supabaseAnon()
-  if (!sb) return false
   try {
-    const { data, error } = await sb.rpc('verify_admin_login', {
-      p_username: u,
-      p_password: password,
+    const res = await fetch('/api/admin-gateway', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'verifyAdminLogin',
+        payload: { username: u, password, hours },
+        session: null,
+      }),
     })
-    if (error) {
-      console.warn('[admin] RPC verify_admin_login error:', error.message)
+    let json: unknown
+    try {
+      json = (await res.json()) as unknown
+    } catch {
       return false
     }
-    return !!data
+    if (
+      !json ||
+      typeof json !== 'object' ||
+      !('ok' in json) ||
+      typeof (json as { ok?: unknown }).ok !== 'boolean'
+    ) {
+      console.warn('[admin] verifyAdminLogin: malformed server response')
+      return false
+    }
+    const shaped = json as
+      | { ok: true; data: { session: AdminSession } }
+      | { ok: false; error: string }
+    if (!shaped.ok) {
+      console.warn('[admin] verifyAdminLogin rejected:', shaped.error)
+      return false
+    }
+    const sess = shaped.data?.session
+    if (!sess || !sess.user || !sess.signature || typeof sess.expiresAt !== 'number') {
+      console.warn('[admin] verifyAdminLogin: missing session payload')
+      return false
+    }
+    try {
+      localStorage.setItem(ADMIN_SESSION_KEY, JSON.stringify(sess))
+    } catch {
+      /* ignore */
+    }
+    return true
   } catch (e) {
-    console.warn('[admin] verifyAdminLogin failed:', e)
+    console.warn('[admin] verifyAdminLogin network error:', e)
     return false
   }
 }

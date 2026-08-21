@@ -164,14 +164,87 @@ function verifyAdminSessionOrThrow(sess: AdminSession | null | undefined): { use
   const a = Buffer.from(expected)
   const b = Buffer.from(String(sess.signature))
   if (a.length !== b.length || !timingSafeEqual(a, b)) {
-    // Allow legacy-hash length mismatch fallback comparison (timingSafeEqual
-    // requires same length). For HMAC deployments both will be 64 hex chars
-    // and equal length; the legacy path emits a different length.
     if (expected !== String(sess.signature)) {
       throw Object.assign(new Error('Unauthorized: invalid admin session signature.'), { status: 401 })
     }
   }
   return { user: sess.user }
+}
+
+function timingSafeEqualStrings(a: string, b: string): boolean {
+  const ab = Buffer.from(a)
+  const bb = Buffer.from(b)
+  if (ab.length !== bb.length) return false
+  return timingSafeEqual(ab, bb)
+}
+
+function signAdminSession(user: string, hours = 8): AdminSession {
+  const issuedAt = Date.now()
+  const expiresAt = issuedAt + Math.max(1, hours) * 3600 * 1000
+  const salt =
+    (process.env.BBB_ADMIN_SIGN_SALT as string | undefined)?.trim() ||
+    'bbb-admin-token-v1'
+  const algo = ((process.env.BBB_ADMIN_SIGN_ALGO as string | undefined) || 'legacy').trim().toLowerCase()
+  const msg = user + '|' + String(issuedAt) + '|' + String(expiresAt)
+  const signature =
+    algo === 'hmac'
+      ? createHmac('sha256', salt).update(msg).digest('hex')
+      : legacyClientHash(msg, salt)
+  return { user, issuedAt, expiresAt, signature }
+}
+
+async function actionVerifyAdminLoginViaEnv(payload: unknown): Promise<{ session: AdminSession } | null> {
+  const p = (payload ?? {}) as { username?: string; password?: string; hours?: number } | undefined
+  const u = typeof p?.username === 'string' ? p.username.trim() : ''
+  const pw = typeof p?.password === 'string' ? p.password : ''
+  if (!u || !pw) return null
+  const envUser = ((process.env.BBB_ADMIN_USERNAME as string | undefined) ?? '').trim()
+  const envPass = ((process.env.BBB_ADMIN_PASSWORD as string | undefined) ?? '').trim()
+  if (!envUser || !envPass) return null
+  const userOk = timingSafeEqualStrings(u.toLowerCase(), envUser.toLowerCase())
+  const passOk = timingSafeEqualStrings(pw, envPass)
+  if (!userOk || !passOk) {
+    throw Object.assign(new Error('Invalid username or password.'), { status: 401 })
+  }
+  const hours = typeof p.hours === 'number' && p.hours > 0 && p.hours < 24 * 365 ? p.hours : 8
+  return { session: signAdminSession(u, hours) }
+}
+
+async function actionVerifyAdminLoginViaDb(payload: unknown): Promise<{ session: AdminSession } | null> {
+  const p = (payload ?? {}) as { username?: string; password?: string; hours?: number } | undefined
+  const u = typeof p?.username === 'string' ? p.username.trim() : ''
+  const pw = typeof p?.password === 'string' ? p.password : ''
+  if (!u || !pw) return null
+  const sb = getServiceSupabase()
+  const { data, error } = await sb.rpc('verify_admin_login', {
+    p_username: u,
+    p_password: pw,
+  })
+  if (error) {
+    throw new Error('verify_admin_login RPC error: ' + error.message)
+  }
+  if (!data) {
+    throw Object.assign(new Error('Invalid username or password.'), { status: 401 })
+  }
+  const hours = typeof p.hours === 'number' && p.hours > 0 && p.hours < 24 * 365 ? p.hours : 8
+  return { session: signAdminSession(u, hours) }
+}
+
+async function actionVerifyAdminLogin(payload: unknown): Promise<{ session: AdminSession }> {
+  let envErr: unknown = null
+  try {
+    const viaEnv = await actionVerifyAdminLoginViaEnv(payload)
+    if (viaEnv) return viaEnv
+  } catch (e) {
+    envErr = e
+  }
+  try {
+    const viaDb = await actionVerifyAdminLoginViaDb(payload)
+    if (viaDb) return viaDb
+  } catch (e) {
+    if (!envErr) envErr = e
+  }
+  throw envErr || Object.assign(new Error('Invalid username or password.'), { status: 401 })
 }
 
 // ---- Action handlers --------------------------------------------------------
@@ -411,6 +484,23 @@ export async function handler(event: HandlerEvent): Promise<HandlerResponse> {
     return jsonResponse(400, err('Invalid JSON body: ' + (e instanceof Error ? e.message : String(e))))
   }
 
+  const action = String(body.action || '')
+
+  // verifyAdminLogin MUST run BEFORE the verifyAdminSessionOrThrow check below,
+  // because a caller attempting to log in does NOT have a signed session yet.
+  // Any other action is only executed with a valid session.
+  if (action === 'verifyAdminLogin') {
+    try {
+      return jsonResponse(200, ok(await actionVerifyAdminLogin(body.payload)))
+    } catch (e) {
+      const status = e && typeof e === 'object' && 'status' in e && typeof (e as { status: unknown }).status === 'number'
+        ? (e as { status: number }).status
+        : 401
+      const msg = e instanceof Error ? e.message : String(e)
+      return jsonResponse(status, err(msg))
+    }
+  }
+
   // Verify session FIRST before any DB action runs.
   try {
     verifyAdminSessionOrThrow(body.session)
@@ -423,7 +513,6 @@ export async function handler(event: HandlerEvent): Promise<HandlerResponse> {
   }
 
   try {
-    const action = String(body.action || '')
     switch (action) {
       case 'loadLimitsEnsure':
         return jsonResponse(200, ok(await actionLoadLimitsEnsure(body.payload)))
