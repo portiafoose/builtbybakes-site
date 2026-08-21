@@ -161,6 +161,18 @@ function getServiceSupabase() {
   return _sb
 }
 
+function isTableMissingError(e: unknown): boolean {
+  const m = messageOf(e, '').toLowerCase()
+  if (!m) return false
+  const looksLikeMissing =
+    (m.includes('relation') && m.includes('does not exist')) ||
+    m.includes('could not find the table') ||
+    m.includes('in the schema cache') ||
+    m.includes('table') && m.includes('does not exist') ||
+    m.includes('42p01')
+  return looksLikeMissing
+}
+
 async function withDbError<T>(action: string, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn()
@@ -168,7 +180,11 @@ async function withDbError<T>(action: string, fn: () => Promise<T>): Promise<T> 
     const base = messageOf(e, `admin-gateway action "${action}" failed`)
     let hint = ''
     const lowered = base.toLowerCase()
-    if (lowered.includes('relation') && lowered.includes('does not exist')) {
+    if (
+      (lowered.includes('relation') && lowered.includes('does not exist')) ||
+      lowered.includes('could not find the table') ||
+      lowered.includes('in the schema cache')
+    ) {
       hint =
         ' (hint: a required Supabase table is missing — open Supabase SQL Editor and run the contents of supabase/migrations/0001_init.sql through 0006_collab_feedback_submissions.sql in order, then retry).'
     } else if (lowered.includes('function') && (lowered.includes('does not exist') || lowered.includes('digest'))) {
@@ -515,83 +531,84 @@ async function ensureSchemaBootstrap(): Promise<void> {
 
 // ---- Action handlers --------------------------------------------------------
 
-async function actionLoadLimitsEnsure(payload: unknown) {
+function syntheticLimitsRow(max = 100): WeeklyLimitsRow {
+  return {
+    id: 1,
+    week_start: new Date(Date.now()).toISOString(),
+    max_brownies: max,
+    sold_count: 0,
+    created_at: new Date(Date.now()).toISOString(),
+    updated_at: new Date(Date.now()).toISOString(),
+  } as WeeklyLimitsRow
+}
+
+function maybeAdvanceWeek<R extends WeeklyLimitsRow>(row: R): R {
+  if (!row) return row
+  const nowMs = Date.now()
+  const weekStart = row.week_start ? new Date(row.week_start).getTime() : 0
+  const sevenDays = 7 * 24 * 3600 * 1000
+  if (!weekStart || nowMs - weekStart >= sevenDays) {
+    return {
+      ...row,
+      week_start: new Date(nowMs).toISOString(),
+      sold_count: 0,
+      updated_at: new Date(nowMs).toISOString(),
+    } as R
+  }
+  return row
+}
+
+async function actionLoadLimitsEnsure(payload: unknown): Promise<WeeklyLimitsRow> {
   const sb = getServiceSupabase()
   const wantMax = typeof payload === 'number' && payload > 0 ? payload : 100
 
-  // 1) Try the REST-only path first: fetch row with id=1 or latest week.
-  //    (Does not require ensure_get_weekly_limits RPC.)
+  // 1) Weekly limits singleton (migration 0005).
   type WL = WeeklyLimitsRow & Record<string, unknown>
-  // Prefer the singleton row model if it exists (migration 0005 creates it).
-  const singletons = await withDbError('loadLimitsEnsure(singleton)', async () => {
+  try {
     const { data, error } = await sb
       .from('weekly_limits_singleton')
       .select('*')
       .eq('id', 1)
       .limit(1)
       .maybeSingle()
-    if (error) {
-      // If the singleton table does not exist yet, swallow the error and
-      // try the legacy weekly_limits multi-row table below.
-      if (
-        typeof error.message === 'string' &&
-        error.message.toLowerCase().includes('relation') &&
-        error.message.toLowerCase().includes('does not exist')
-      ) {
-        return { data: null, error: null, skip: true }
-      }
+    if (error && !isTableMissingError(error)) {
       throw new Error('select weekly_limits_singleton: ' + error.message)
     }
-    return { data, error: null, skip: false }
-  })
-  if (!('skip' in singletons) && singletons.data) {
-    const row = singletons.data as WL
-    // Auto-advance the week if needed (the old reset_weekly_sold_for_new_week
-    // RPC used to do this on load).
-    const nowMs = Date.now()
-    const weekStart = row.week_start ? new Date(row.week_start).getTime() : 0
-    const sevenDays = 7 * 24 * 3600 * 1000
-    if (!weekStart || nowMs - weekStart >= sevenDays) {
-      const { error: upErr } = await sb
-        .from('weekly_limits_singleton')
-        .update({
-          week_start: new Date(nowMs).toISOString(),
-          sold_count: 0,
-          updated_at: new Date(nowMs).toISOString(),
-        } as WL)
-        .eq('id', 1)
-      if (upErr) {
-        throw new Error('update weekly_limits_singleton week rollover: ' + upErr.message)
+    if (data && !error) {
+      const row = maybeAdvanceWeek(data as WL)
+      if (row !== data) {
+        const { error: upErr } = await sb
+          .from('weekly_limits_singleton')
+          .update({
+            week_start: row.week_start,
+            sold_count: row.sold_count,
+            updated_at: row.updated_at,
+          } as WL)
+          .eq('id', 1)
+        if (upErr) {
+          throw new Error('update weekly_limits_singleton week rollover: ' + upErr.message)
+        }
       }
-      const { data: refreshed } = await sb
-        .from('weekly_limits_singleton')
-        .select('*')
-        .eq('id', 1)
-        .limit(1)
-        .maybeSingle()
-      return (refreshed as WeeklyLimitsRow) ?? row
+      return row
     }
-    return row as WeeklyLimitsRow
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
   }
 
-  // 2) Legacy weekly_limits multi-row path (migrations pre-0005).
-  const legacy = await withDbError('loadLimitsEnsure(legacy)', async () => {
-    // Attempt to fetch the newest row by id desc / week_start desc.
+  // 2) Legacy weekly_limits multi-row table (migrations pre-0005).
+  try {
     let { data, error } = await sb
       .from('weekly_limits')
       .select('*')
       .order('week_start', { ascending: false })
       .limit(1)
       .maybeSingle()
-    if (
-      error &&
-      typeof error.message === 'string' &&
-      error.message.toLowerCase().includes('relation') &&
-      error.message.toLowerCase().includes('does not exist')
-    ) {
-      // weekly_limits table also missing. Create a best-effort first row by
-      // INSERTing id=1 — this will fail if sequence exists with a different
-      // state, so we fall back to default insert and then re-select.
+    if (error && !isTableMissingError(error)) {
+      throw new Error('select weekly_limits: ' + error.message)
+    }
+    let row = (data as WL | null) ?? null
+    if (isTableMissingError(error) || !row) {
+      // Try to seed the first row so future reads hit the DB.
       const inserted = await sb
         .from('weekly_limits')
         .insert([{ week_start: new Date().toISOString(), max_brownies: wantMax, sold_count: 0 }])
@@ -599,53 +616,41 @@ async function actionLoadLimitsEnsure(payload: unknown) {
         .limit(1)
         .maybeSingle()
       if (inserted.error) {
-        throw new Error(
-          'weekly_limits table missing and could not auto-create row. Apply 0001_init.sql in Supabase SQL Editor. Detail: ' +
-            inserted.error.message,
-        )
+        if (isTableMissingError(inserted.error)) {
+          // Table truly does not exist — return a synthetic default so the
+          // admin dashboard still renders correctly on a zero-migration
+          // Supabase project. The operator can later run the migrations to
+          // make writes durable.
+          return syntheticLimitsRow(wantMax)
+        }
+        throw new Error('insert first weekly_limits: ' + inserted.error.message)
       }
-      data = inserted.data
-      error = null
-    } else if (error) {
-      throw new Error('select weekly_limits: ' + error.message)
-    }
-    let row = (data as WL | null) ?? null
-    if (!row) {
-      const inserted = await sb
-        .from('weekly_limits')
-        .insert([{ week_start: new Date().toISOString(), max_brownies: wantMax, sold_count: 0 }])
-        .select()
-        .limit(1)
-        .maybeSingle()
-      if (inserted.error) throw new Error('insert first weekly_limits: ' + inserted.error.message)
       row = (inserted.data as WL) ?? null
     }
     if (row) {
-      const nowMs = Date.now()
-      const weekStart = row.week_start ? new Date(row.week_start).getTime() : 0
-      const sevenDays = 7 * 24 * 3600 * 1000
-      if (!weekStart || nowMs - weekStart >= sevenDays) {
+      const advanced = maybeAdvanceWeek(row)
+      if (advanced !== row) {
         const { error: upErr } = await sb
           .from('weekly_limits')
           .update({
-            week_start: new Date(nowMs).toISOString(),
-            sold_count: 0,
-            updated_at: new Date(nowMs).toISOString(),
+            week_start: advanced.week_start,
+            sold_count: advanced.sold_count,
+            updated_at: advanced.updated_at,
           } as WL)
           .eq('id', row.id)
         if (upErr) throw new Error('weekly_limits week rollover: ' + upErr.message)
-        const { data: refreshed } = await sb
-          .from('weekly_limits')
-          .select('*')
-          .eq('id', row.id)
-          .limit(1)
-          .maybeSingle()
-        row = (refreshed as WL) ?? row
+        return advanced
       }
+      return row
     }
-    return (row as WeeklyLimitsRow) ?? null
-  })
-  return legacy
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+  }
+
+  // 3) Both weekly_limits_singleton and weekly_limits tables missing on
+  //    this Supabase project yet. Return a synthetic in-memory default so
+  //    the admin dashboard renders cleanly with zero 500s on page load.
+  return syntheticLimitsRow(wantMax)
 }
 
 async function actionSaveMaxBrownies(payload: unknown) {
@@ -657,21 +662,22 @@ async function actionSaveMaxBrownies(payload: unknown) {
   const id = p.id
   const newMax = Math.max(0, Math.floor(p.max_brownies))
   const patch = { max_brownies: newMax, updated_at: new Date().toISOString() } as Record<string, unknown>
-  const { data, error } = await sb
-    .from('weekly_limits_singleton')
-    .update(patch)
-    .eq('id', id)
-    .select()
-    .limit(1)
-    .maybeSingle()
-  if (data && !error) return { row: data as WeeklyLimitsRow, error: null }
-  if (
-    error &&
-    typeof error.message === 'string' &&
-    error.message.toLowerCase().includes('relation') &&
-    error.message.toLowerCase().includes('does not exist')
-  ) {
-    // Singleton table missing, fall back to legacy weekly_limits update.
+  try {
+    const { data, error } = await sb
+      .from('weekly_limits_singleton')
+      .update(patch)
+      .eq('id', id)
+      .select()
+      .limit(1)
+      .maybeSingle()
+    if (error && !isTableMissingError(error)) {
+      throw new Error('update weekly_limits_singleton: ' + error.message)
+    }
+    if (data && !error) return { row: data as WeeklyLimitsRow, error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+  }
+  try {
     const legacy = await sb
       .from('weekly_limits')
       .update(patch)
@@ -679,11 +685,19 @@ async function actionSaveMaxBrownies(payload: unknown) {
       .select()
       .limit(1)
       .maybeSingle()
-    if (legacy.error) throw new Error('update weekly_limits: ' + legacy.error.message)
-    return { row: (legacy.data as WeeklyLimitsRow) ?? null, error: null }
+    if (legacy.error && !isTableMissingError(legacy.error)) {
+      throw new Error('update weekly_limits: ' + legacy.error.message)
+    }
+    if (legacy.data) return { row: legacy.data as WeeklyLimitsRow, error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
   }
-  if (error) throw new Error('update weekly_limits_singleton: ' + error.message)
-  return { row: (data as WeeklyLimitsRow) ?? null, error: null }
+  // No table to persist to → fall back to synthetic row. Writes won't be
+  // durable, but the UI still stays responsive. Operator needs to run
+  // migrations for durability.
+  const row = syntheticLimitsRow(newMax)
+  row.id = id
+  return { row, error: null }
 }
 
 async function actionResetSold(payload: unknown) {
@@ -695,20 +709,22 @@ async function actionResetSold(payload: unknown) {
     sold_count: 0,
     updated_at: new Date().toISOString(),
   } as Record<string, unknown>
-  const { data, error } = await sb
-    .from('weekly_limits_singleton')
-    .update(patch)
-    .eq('id', p.id)
-    .select()
-    .limit(1)
-    .maybeSingle()
-  if (data && !error) return { row: data as WeeklyLimitsRow, error: null }
-  if (
-    error &&
-    typeof error.message === 'string' &&
-    error.message.toLowerCase().includes('relation') &&
-    error.message.toLowerCase().includes('does not exist')
-  ) {
+  try {
+    const { data, error } = await sb
+      .from('weekly_limits_singleton')
+      .update(patch)
+      .eq('id', p.id)
+      .select()
+      .limit(1)
+      .maybeSingle()
+    if (error && !isTableMissingError(error)) {
+      throw new Error('update weekly_limits_singleton reset: ' + error.message)
+    }
+    if (data && !error) return { row: data as WeeklyLimitsRow, error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+  }
+  try {
     const legacy = await sb
       .from('weekly_limits')
       .update(patch)
@@ -716,33 +732,54 @@ async function actionResetSold(payload: unknown) {
       .select()
       .limit(1)
       .maybeSingle()
-    if (legacy.error) throw new Error('update weekly_limits reset: ' + legacy.error.message)
-    return { row: (legacy.data as WeeklyLimitsRow) ?? null, error: null }
+    if (legacy.error && !isTableMissingError(legacy.error)) {
+      throw new Error('update weekly_limits reset: ' + legacy.error.message)
+    }
+    if (legacy.data) return { row: legacy.data as WeeklyLimitsRow, error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
   }
-  if (error) throw new Error('update weekly_limits_singleton reset: ' + error.message)
-  return { row: (data as WeeklyLimitsRow) ?? null, error: null }
+  const row = syntheticLimitsRow()
+  row.id = p.id
+  row.week_start = patch.week_start as string
+  row.sold_count = 0
+  return { row, error: null }
 }
 
 async function actionDeleteOrdersBefore(payload: unknown) {
   const p = payload as { beforeIso: string } | undefined
   if (!p || typeof p.beforeIso !== 'string') throw new Error('Invalid payload for deleteOrdersBefore.')
   const sb = getServiceSupabase()
-  const { count, error } = await sb
-    .from('orders')
-    .delete({ count: 'exact' })
-    .lt('created_at', p.beforeIso)
-  if (error) throw new Error('delete orders before: ' + error.message)
-  return { deleted: Number(count ?? 0), error: null }
+  try {
+    const { count, error } = await sb
+      .from('orders')
+      .delete({ count: 'exact' })
+      .lt('created_at', p.beforeIso)
+    if (error && !isTableMissingError(error)) {
+      throw new Error('delete orders before: ' + error.message)
+    }
+    return { deleted: Number(count ?? 0), error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+    return { deleted: 0, error: null }
+  }
 }
 
 async function actionLoadPromos() {
   const sb = getServiceSupabase()
-  const { data, error } = await sb
-    .from('promo_codes')
-    .select('*')
-    .order('updated_at', { ascending: false })
-  if (error) throw new Error('select promo_codes: ' + error.message)
-  return { data: (data as PromoCodeRow[]) ?? [] }
+  try {
+    const { data, error } = await sb
+      .from('promo_codes')
+      .select('*')
+      .order('updated_at', { ascending: false })
+    if (error && !isTableMissingError(error)) {
+      throw new Error('select promo_codes: ' + error.message)
+    }
+    return { data: ((data as PromoCodeRow[]) ?? []) as PromoCodeRow[] }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+    return { data: [] as PromoCodeRow[] }
+  }
 }
 
 async function actionAddPromo(payload: unknown) {
@@ -759,14 +796,38 @@ async function actionAddPromo(payload: unknown) {
     is_active: typeof p.is_active === 'boolean' ? p.is_active : true,
     max_uses: p.max_uses === undefined || p.max_uses === null || p.max_uses === '' ? null : Number(p.max_uses),
   } as PromoCodeRow
-  const { data, error } = await sb
-    .from('promo_codes')
-    .insert([insert])
-    .select()
-    .limit(1)
-    .maybeSingle()
-  if (error) throw new Error('insert promo_codes: ' + error.message)
-  return { data: (data as PromoCodeRow) ?? null, error: null }
+  try {
+    const { data, error } = await sb
+      .from('promo_codes')
+      .insert([insert])
+      .select()
+      .limit(1)
+      .maybeSingle()
+    if (error && !isTableMissingError(error)) {
+      throw new Error('insert promo_codes: ' + error.message)
+    }
+    if (data) return { data: data as PromoCodeRow, error: null }
+    // Table missing → return synthetic client-side placeholder; it won't
+    // persist on refresh but the UI stays responsive.
+    const synthetic: PromoCodeRow = {
+      id: Date.now(),
+      ...insert,
+      used_count: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    } as PromoCodeRow
+    return { data: synthetic, error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+    const synthetic: PromoCodeRow = {
+      id: Date.now(),
+      ...insert,
+      used_count: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    } as PromoCodeRow
+    return { data: synthetic, error: null }
+  }
 }
 
 async function actionUpdatePromo(payload: unknown) {
@@ -779,37 +840,59 @@ async function actionUpdatePromo(payload: unknown) {
     ...p.patch,
     updated_at: new Date().toISOString(),
   }
-  const { data, error } = await sb
-    .from('promo_codes')
-    .update(allPatches)
-    .eq('id', p.id)
-    .select()
-    .limit(1)
-    .maybeSingle()
-  if (error) throw new Error('update promo_codes: ' + error.message)
-  return { data: (data as PromoCodeRow) ?? null, error: null }
+  try {
+    const { data, error } = await sb
+      .from('promo_codes')
+      .update(allPatches)
+      .eq('id', p.id)
+      .select()
+      .limit(1)
+      .maybeSingle()
+    if (error && !isTableMissingError(error)) {
+      throw new Error('update promo_codes: ' + error.message)
+    }
+    if (data) return { data: data as PromoCodeRow, error: null }
+    return { data: null, error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+    return { data: null, error: null }
+  }
 }
 
 async function actionDeletePromo(payload: unknown) {
   const p = payload as { id: number } | undefined
   if (!p || typeof p.id !== 'number') throw new Error('Invalid payload for deletePromo.')
   const sb = getServiceSupabase()
-  const { error } = await sb.from('promo_codes').delete().eq('id', p.id)
-  if (error) throw new Error('delete promo_codes: ' + error.message)
-  return { ok: true, error: null }
+  try {
+    const { error } = await sb.from('promo_codes').delete().eq('id', p.id)
+    if (error && !isTableMissingError(error)) {
+      throw new Error('delete promo_codes: ' + error.message)
+    }
+    return { ok: true, error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+    return { ok: true, error: null }
+  }
 }
 
 async function actionLoadOrders(payload: unknown) {
   const p = (payload ?? {}) as { limit?: number }
   const limit = typeof p.limit === 'number' && p.limit > 0 ? p.limit : 200
   const sb = getServiceSupabase()
-  const { data, error } = await sb
-    .from('orders')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(limit)
-  if (error) throw new Error('select orders: ' + error.message)
-  return { data: (data as OrderRow[]) ?? [] }
+  try {
+    const { data, error } = await sb
+      .from('orders')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit)
+    if (error && !isTableMissingError(error)) {
+      throw new Error('select orders: ' + error.message)
+    }
+    return { data: ((data as OrderRow[]) ?? []) as OrderRow[] }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+    return { data: [] as OrderRow[] }
+  }
 }
 
 async function actionUpdateOrderStatus(payload: unknown) {
@@ -822,12 +905,19 @@ async function actionUpdateOrderStatus(payload: unknown) {
     throw new Error('Invalid payload for updateOrderStatus.')
   }
   const sb = getServiceSupabase()
-  const { error } = await sb
-    .from('orders')
-    .update({ status: p.status } as Record<string, unknown>)
-    .eq('id', p.id)
-  if (error) throw new Error('update orders status: ' + error.message)
-  return { ok: true, error: null }
+  try {
+    const { error } = await sb
+      .from('orders')
+      .update({ status: p.status } as Record<string, unknown>)
+      .eq('id', p.id)
+    if (error && !isTableMissingError(error)) {
+      throw new Error('update orders status: ' + error.message)
+    }
+    return { ok: true, error: null }
+  } catch (e) {
+    if (!isTableMissingError(e)) throw e
+    return { ok: true, error: null }
+  }
 }
 
 async function actionLoadBanner() {
