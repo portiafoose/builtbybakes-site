@@ -82,8 +82,18 @@ export async function adminGateway<T = unknown>(
     let json: unknown
     try {
       json = (await res.json()) as unknown
-    } catch {
-      return { ok: false, error: `HTTP ${res.status} — invalid JSON response.` }
+    } catch (nonJson) {
+      const msg =
+        nonJson instanceof Error
+          ? nonJson.message
+          : typeof nonJson === 'string'
+            ? nonJson
+            : `HTTP ${res.status} — invalid JSON response.`
+      console.warn(
+        `[admin] adminGateway("${action}") HTTP ${res.status} — server returned non-JSON body:`,
+        nonJson,
+      )
+      return { ok: false, error: msg }
     }
     if (
       !json ||
@@ -91,6 +101,10 @@ export async function adminGateway<T = unknown>(
       !('ok' in json) ||
       typeof (json as { ok?: unknown }).ok !== 'boolean'
     ) {
+      console.warn(
+        `[admin] adminGateway("${action}") HTTP ${res.status} — malformed response payload:`,
+        json,
+      )
       return { ok: false, error: `HTTP ${res.status} — malformed gateway response.` }
     }
     const shaped = json as
@@ -99,9 +113,18 @@ export async function adminGateway<T = unknown>(
     if (shaped.ok) {
       return { ok: true, data: shaped.data }
     }
+    // Log the server-provided error message explicitly to DevTools console so
+    // the operator knows *which* env var / table / RPC is failing. The UI shows
+    // a brief inline failure as well, but the console is the authoritative
+    // place for the full actionable message.
+    console.warn(
+      `[admin] adminGateway("${action}") rejected HTTP ${res.status}:`,
+      shaped.error,
+    )
     return { ok: false, error: shaped.error }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
+    console.warn(`[admin] adminGateway("${action}") threw:`, e)
     return { ok: false, error: `adminGateway network error: ${msg}` }
   }
 }

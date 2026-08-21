@@ -108,19 +108,81 @@ function err(error: string) {
 
 function requireEnv(name: string): string {
   const v = (process.env[name] as string | undefined) ?? ''
-  if (!v.trim()) throw new Error(`${name} is not set in Netlify Environment Variables.`)
-  return v
+  if (!v.trim()) {
+    throw Object.assign(
+      new Error(
+        `Missing required server env ${name}. Go to Netlify → Site configuration → Environment variables, add ${name} with the correct value, and redeploy.`,
+      ),
+      { status: 500 },
+    )
+  }
+  return v.trim()
+}
+
+function statusOf(e: unknown, fallback = 500): number {
+  if (e && typeof e === 'object' && 'status' in e) {
+    const s = (e as { status?: unknown }).status
+    if (typeof s === 'number' && s >= 400 && s < 600) return s
+  }
+  return fallback
+}
+
+function messageOf(e: unknown, fallback = 'Internal server error.'): string {
+  if (e instanceof Error && e.message && e.message.trim()) return e.message
+  if (typeof e === 'string' && e.trim()) return e
+  const safe = JSON.stringify(e)
+  if (safe && safe !== '{}') return safe
+  return fallback
+}
+
+function requireAdminEnvFor(action: string, names: string[]): void {
+  for (const n of names) {
+    const v = (process.env[n] as string | undefined) ?? ''
+    if (!v.trim()) {
+      throw Object.assign(
+        new Error(
+          `admin-gateway action "${action}" requires ${names.join(', ')} in Netlify Environment Variables. Missing: ${n}. Add them in Netlify → Site configuration → Environment variables, then redeploy.`,
+        ),
+        { status: 500 },
+      )
+    }
+  }
 }
 
 let _sb: ReturnType<typeof createClient> | null = null
 function getServiceSupabase() {
   if (_sb) return _sb
+  requireAdminEnvFor('(all DB actions)', ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'])
   const url = requireEnv('SUPABASE_URL')
   const key = requireEnv('SUPABASE_SERVICE_ROLE_KEY')
   _sb = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
   })
   return _sb
+}
+
+async function withDbError<T>(action: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn()
+  } catch (e) {
+    const base = messageOf(e, `admin-gateway action "${action}" failed`)
+    let hint = ''
+    const lowered = base.toLowerCase()
+    if (lowered.includes('relation') && lowered.includes('does not exist')) {
+      hint =
+        ' (hint: a required Supabase table is missing — open Supabase SQL Editor and run the contents of supabase/migrations/0001_init.sql through 0006_collab_feedback_submissions.sql in order, then retry).'
+    } else if (lowered.includes('function') && (lowered.includes('does not exist') || lowered.includes('digest'))) {
+      hint =
+        ' (hint: required Supabase RPC or pgcrypto extension is missing — open Supabase SQL Editor and run supabase/migrations/0001_init.sql + 0002_force_reenroll_admin.sql, then retry).'
+    } else if (lowered.includes('invalid api key') || lowered.includes('jwt') || lowered.includes('401') || lowered.includes('anon')) {
+      hint =
+        ' (hint: SUPABASE_SERVICE_ROLE_KEY is wrong or was swapped for the anon key — use the service_role secret from Supabase → Project Settings → API.)'
+    } else if (lowered.includes('sockettimeout') || lowered.includes('enotfound') || lowered.includes('fetch failed')) {
+      hint =
+        ' (hint: SUPABASE_URL may be wrong or unreachable from the Function runtime — copy it exactly from Supabase → Project Settings → API → Project URL.)'
+    }
+    throw Object.assign(new Error(base + hint), { status: statusOf(e, 500) })
+  }
 }
 
 // Backwards-compat helper — matches the EXACT imul hash adminSignature() that
@@ -568,35 +630,66 @@ export async function handler(event: HandlerEvent): Promise<HandlerResponse> {
   try {
     switch (action) {
       case 'loadLimitsEnsure':
-        return jsonResponse(200, ok(await actionLoadLimitsEnsure(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionLoadLimitsEnsure(body.payload))),
+        )
       case 'saveMaxBrownies':
-        return jsonResponse(200, ok(await actionSaveMaxBrownies(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionSaveMaxBrownies(body.payload))),
+        )
       case 'resetSold':
-        return jsonResponse(200, ok(await actionResetSold(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionResetSold(body.payload))),
+        )
       case 'deleteOrdersBefore':
-        return jsonResponse(200, ok(await actionDeleteOrdersBefore(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionDeleteOrdersBefore(body.payload))),
+        )
       case 'loadPromos':
-        return jsonResponse(200, ok(await actionLoadPromos()))
+        return jsonResponse(200, ok(await withDbError(action, () => actionLoadPromos())))
       case 'addPromo':
-        return jsonResponse(200, ok(await actionAddPromo(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionAddPromo(body.payload))),
+        )
       case 'updatePromo':
-        return jsonResponse(200, ok(await actionUpdatePromo(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionUpdatePromo(body.payload))),
+        )
       case 'deletePromo':
-        return jsonResponse(200, ok(await actionDeletePromo(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionDeletePromo(body.payload))),
+        )
       case 'loadOrders':
-        return jsonResponse(200, ok(await actionLoadOrders(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionLoadOrders(body.payload))),
+        )
       case 'updateOrderStatus':
-        return jsonResponse(200, ok(await actionUpdateOrderStatus(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionUpdateOrderStatus(body.payload))),
+        )
       case 'loadBanner':
-        return jsonResponse(200, ok(await actionLoadBanner()))
+        return jsonResponse(200, ok(await withDbError(action, () => actionLoadBanner())))
       case 'saveBanner':
-        return jsonResponse(200, ok(await actionSaveBanner(body.payload)))
+        return jsonResponse(
+          200,
+          ok(await withDbError(action, () => actionSaveBanner(body.payload))),
+        )
       default:
         return jsonResponse(400, err(`Unknown action: ${action}`))
     }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    return jsonResponse(500, err(msg))
+    const status = statusOf(e, 500)
+    const msg = messageOf(e, `admin-gateway action "${action}" failed`)
+    return jsonResponse(status, err(msg))
   }
 }
 
