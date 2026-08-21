@@ -195,19 +195,35 @@ function signAdminSession(user: string, hours = 8): AdminSession {
 
 async function actionVerifyAdminLoginViaEnv(payload: unknown): Promise<{ session: AdminSession } | null> {
   const p = (payload ?? {}) as { username?: string; password?: string; hours?: number } | undefined
-  const u = typeof p?.username === 'string' ? p.username.trim() : ''
-  const pw = typeof p?.password === 'string' ? p.password : ''
-  if (!u || !pw) return null
+  const submittedUser = typeof p?.username === 'string' ? p.username.trim() : ''
+  const submittedPass = typeof p?.password === 'string' ? p.password : ''
+  if (!submittedUser || !submittedPass) return null
+
   const envUser = ((process.env.BBB_ADMIN_USERNAME as string | undefined) ?? '').trim()
   const envPass = ((process.env.BBB_ADMIN_PASSWORD as string | undefined) ?? '').trim()
-  if (!envUser || !envPass) return null
-  const userOk = timingSafeEqualStrings(u.toLowerCase(), envUser.toLowerCase())
-  const passOk = timingSafeEqualStrings(pw, envPass)
+  const envUserAlt = ((process.env.BBB_ADMIN_USER as string | undefined) ?? '').trim()
+  const envPassAlt = ((process.env.BBB_ADMIN_PASS as string | undefined) ?? '').trim()
+
+  const wantUser = envUser || envUserAlt
+  const wantPass = envPass || envPassAlt
+
+  if (!wantUser || !wantPass) {
+    // Both username + password env must be set for the env login path to be
+    // available. If either is missing, return null cleanly so the DB fallback
+    // can run (without wrapping in a throw that bubbles as 401).
+    return null
+  }
+
+  const userOk = timingSafeEqualStrings(submittedUser.toLowerCase(), wantUser.toLowerCase())
+  const passOk =
+    timingSafeEqualStrings(submittedPass, wantPass) ||
+    (submittedPass.length > 0 && wantPass.length > 0 &&
+      timingSafeEqualStrings(submittedPass, wantPass))
   if (!userOk || !passOk) {
     throw Object.assign(new Error('Invalid username or password.'), { status: 401 })
   }
   const hours = typeof p.hours === 'number' && p.hours > 0 && p.hours < 24 * 365 ? p.hours : 8
-  return { session: signAdminSession(u, hours) }
+  return { session: signAdminSession(submittedUser, hours) }
 }
 
 async function actionVerifyAdminLoginViaDb(payload: unknown): Promise<{ session: AdminSession } | null> {
@@ -231,20 +247,57 @@ async function actionVerifyAdminLoginViaDb(payload: unknown): Promise<{ session:
 }
 
 async function actionVerifyAdminLogin(payload: unknown): Promise<{ session: AdminSession }> {
-  let envErr: unknown = null
+  // 1) ENV VAR LOGIN (primary, preferred).
+  //    Use this path whenever BBB_ADMIN_USERNAME/PASSWORD are set, and ONLY
+  //    fall back to the Supabase DB path when the env vars are not configured
+  //    at all.
+  //    NOTE: the env path can produce two outcomes:
+  //      - credentials matched => return signed session (done)
+  //      - credentials rejected => 401, STOP (do NOT try the DB fallback — a
+  //        typo in env vs a typo from the user would otherwise loop back and
+  //        surface the pgcrypto/digest error as the final user-visible failure,
+  //        which is exactly the bug reported).
+  //      - env vars not set => return null, try DB path next.
+  let envLoginAvailable = false
   try {
     const viaEnv = await actionVerifyAdminLoginViaEnv(payload)
     if (viaEnv) return viaEnv
+    // If viaEnv returned null without throwing, it means the env vars weren't
+    // both set → DB fallback is allowed below.
+    envLoginAvailable = false
   } catch (e) {
-    envErr = e
+    // Env vars WERE set AND the submitted creds did not match the env creds.
+    // Do NOT continue to DB fallback — surface the 401 immediately.
+    throw e
   }
+
+  // 2) DB RPC LOGIN (fallback — only when env login path is disabled).
   try {
     const viaDb = await actionVerifyAdminLoginViaDb(payload)
     if (viaDb) return viaDb
   } catch (e) {
-    if (!envErr) envErr = e
+    // If the DB path errors out for infra reasons (e.g. pgcrypto missing,
+    // extension not enabled, migrate never ran) AND the env-login path was
+    // never configured at all, we still want to surface a useful error to
+    // whoever's debugging in prod. Repackage with a hint rather than the
+    // raw postgres digest error.
+    const dbMsg = e instanceof Error ? e.message : String(e)
+    const hints: string[] = []
+    if (dbMsg.toLowerCase().includes('digest') || dbMsg.toLowerCase().includes('pgcrypto')) {
+      hints.push(
+        'Supabase pgcrypto extension / verify_admin_login RPC not deployed. Either (a) run 0001_init.sql in Supabase SQL Editor, or (b) set BBB_ADMIN_USERNAME + BBB_ADMIN_PASSWORD in Netlify env vars (recommended).',
+      )
+    }
+    if (!envLoginAvailable) {
+      hints.push('Netlify env login was NOT available — set BBB_ADMIN_USERNAME + BBB_ADMIN_PASSWORD to enable the env login path.')
+    }
+    const finalMsg = hints.length
+      ? hints.join(' ') + ' Underlying DB error: ' + dbMsg
+      : dbMsg
+    throw Object.assign(new Error(finalMsg), { status: 401 })
   }
-  throw envErr || Object.assign(new Error('Invalid username or password.'), { status: 401 })
+
+  throw Object.assign(new Error('Invalid username or password.'), { status: 401 })
 }
 
 // ---- Action handlers --------------------------------------------------------
