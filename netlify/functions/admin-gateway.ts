@@ -106,17 +106,24 @@ function err(error: string) {
   return { ok: false as const, error }
 }
 
-function requireEnv(name: string): string {
-  const v = (process.env[name] as string | undefined) ?? ''
-  if (!v.trim()) {
-    throw Object.assign(
-      new Error(
-        `Missing required server env ${name}. Go to Netlify → Site configuration → Environment variables, add ${name} with the correct value, and redeploy.`,
-      ),
-      { status: 500 },
-    )
+function requireEnv(primaryName: string, aliases: string[] = []): string {
+  const candidates = [primaryName, ...aliases]
+  for (const name of candidates) {
+    const raw = (process.env[name] as string | undefined) ?? ''
+    // Strip accidental outer quotes/spaces/newlines that often sneak in when
+    // pasting values into the Netlify env var panel.
+    const trimmed = raw.trim().replace(/^["']|["']$/g, '').trim()
+    if (trimmed) return trimmed
   }
-  return v.trim()
+  const list = candidates.map((n) => `'${n}'`).join(' or ')
+  throw Object.assign(
+    new Error(
+      `Missing required server env ${list}. Go to Netlify → Site configuration → Environment variables, add a Variable named '${primaryName}' with the correct value (SCOPE = Functions or All scopes; tick deploy contexts; Save & deploy). Other env vars currently visible to this Function instance: ${Object.keys(process.env)
+        .filter((k) => /stripe|supabase|bbb_admin|vite_/i.test(k))
+        .join(', ') || '(none matched)'} (full count: ${Object.keys(process.env).length}).`,
+    ),
+    { status: 500 },
+  )
 }
 
 function statusOf(e: unknown, fallback = 500): number {
@@ -153,8 +160,8 @@ let _sb: ReturnType<typeof createClient> | null = null
 function getServiceSupabase() {
   if (_sb) return _sb
   requireAdminEnvFor('(all DB actions)', ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'])
-  const url = requireEnv('SUPABASE_URL')
-  const key = requireEnv('SUPABASE_SERVICE_ROLE_KEY')
+  const url = requireEnv('SUPABASE_URL', ['SUPABASE_PROJECT_URL', 'VITE_SUPABASE_URL'])
+  const key = requireEnv('SUPABASE_SERVICE_ROLE_KEY', ['SUPABASE_SERVICE_KEY', 'SUPABASE_SR_KEY'])
   _sb = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
   })
@@ -289,13 +296,16 @@ async function actionVerifyAdminLoginViaEnv(payload: unknown): Promise<{ session
   const submittedPass = typeof p?.password === 'string' ? p.password : ''
   if (!submittedUser || !submittedPass) return null
 
-  const envUser = ((process.env.BBB_ADMIN_USERNAME as string | undefined) ?? '').trim()
-  const envPass = ((process.env.BBB_ADMIN_PASSWORD as string | undefined) ?? '').trim()
-  const envUserAlt = ((process.env.BBB_ADMIN_USER as string | undefined) ?? '').trim()
-  const envPassAlt = ((process.env.BBB_ADMIN_PASS as string | undefined) ?? '').trim()
-
-  const wantUser = envUser || envUserAlt
-  const wantPass = envPass || envPassAlt
+  const pick = (candidates: string[]): string => {
+    for (const n of candidates) {
+      const raw = (process.env[n] as string | undefined) ?? ''
+      const v = raw.trim().replace(/^["']|["']$/g, '').trim()
+      if (v) return v
+    }
+    return ''
+  }
+  const wantUser = pick(['BBB_ADMIN_USERNAME', 'BBB_ADMIN_USER', 'ADMIN_USERNAME', 'ADMIN_USER'])
+  const wantPass = pick(['BBB_ADMIN_PASSWORD', 'BBB_ADMIN_PASS', 'ADMIN_PASSWORD', 'ADMIN_PASS'])
 
   if (!wantUser || !wantPass) {
     // Both username + password env must be set for the env login path to be

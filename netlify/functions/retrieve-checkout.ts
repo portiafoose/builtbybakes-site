@@ -36,10 +36,24 @@ function jsonResponse(status: number, payload: unknown): HandlerResponse {
   }
 }
 
+function requireEnv(primaryName: string, aliases: string[] = []): string {
+  const candidates = [primaryName, ...aliases]
+  for (const name of candidates) {
+    const raw = (process.env[name] as string | undefined) ?? ''
+    const trimmed = raw.trim().replace(/^["']|["']$/g, '').trim()
+    if (trimmed) return trimmed
+  }
+  const list = candidates.map((n) => `'${n}'`).join(' or ')
+  throw new Error(
+    `Missing required server env ${primaryName}. Go to Netlify → Site configuration → Environment variables and add/republish a Variable named '${primaryName}' with the correct value. Set SCOPE = Functions (or "All scopes") AND tick the deploy contexts you want, then click "Save & deploy". Other variables currently seen on this instance: ${Object.keys(process.env)
+      .filter((k) => /stripe|supabase|bbb_admin/i.test(k))
+      .join(', ') || '(none matched stripe/supabase/bbb_admin)'}.`,
+  )
+}
+
 let serverStripe: Stripe | null = null
 function getStripe(): Stripe {
-  const secret = (process.env.STRIPE_SECRET_KEY as string | undefined) ?? ''
-  if (!secret) throw new Error('STRIPE_SECRET_KEY is not set in Netlify Environment Variables.')
+  const secret = requireEnv('STRIPE_SECRET_KEY', ['STRIPE_SK', 'STRIPE_API_KEY', 'VITE_STRIPE_SECRET_KEY'])
   if (serverStripe) return serverStripe
   serverStripe = new Stripe(secret, {
     apiVersion: '2024-06-20',
